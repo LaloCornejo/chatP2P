@@ -15,6 +15,7 @@
 #include <sstream>
 #include <iomanip>
 #include <functional>
+#include <atomic>
 
 const int PORT = 8080;
 const int BUFFER_SIZE = 1024;
@@ -122,78 +123,76 @@ private:
         listen(serverSocket, 1);
     }
 
-  void acceptConnection() {
-    struct sockaddr_in clientAddr;
-    socklen_t clientAddrLen = sizeof(clientAddr);
-    std::memset(&clientAddr, 0, sizeof(clientAddr));
-    clientSocket = accept(serverSocket, (struct sockaddr*)&clientAddr, &clientAddrLen);
-    if (clientSocket < 0) {
-        throw std::runtime_error("Failed to accept connection");
+    void acceptConnection() {
+        struct sockaddr_in clientAddr;
+        socklen_t clientAddrLen = sizeof(clientAddr);
+        std::memset(&clientAddr, 0, sizeof(clientAddr));
+        clientSocket = accept(serverSocket, (struct sockaddr*)&clientAddr, &clientAddrLen);
+        if (clientSocket < 0) {
+            throw std::runtime_error("Failed to accept connection");
+        }
+
+        char buffer[BUFFER_SIZE];
+        std::memset(buffer, 0, BUFFER_SIZE);
+        ssize_t bytesRead = recv(clientSocket, buffer, BUFFER_SIZE - 1, 0);
+        if (bytesRead <= 0) {
+            close(clientSocket);
+            throw std::runtime_error("Failed to receive chat code from client");
+        }
+
+        std::string receivedHash = std::string(buffer, bytesRead);
+        if (receivedHash != chatCode) {
+            close(clientSocket);
+            throw std::runtime_error("Invalid chat code from client");
+        }
+
+        std::string sc = "/connected";
+        send(clientSocket, sc.c_str(), sc.length(), 0);
+        std::cout << "Client connected with valid chat code" << std::endl;
     }
 
-    char buffer[BUFFER_SIZE];
-    std::memset(buffer, 0, BUFFER_SIZE);
-    ssize_t bytesRead = recv(clientSocket, buffer, BUFFER_SIZE - 1, 0);
-    if (bytesRead <= 0) {
-        close(clientSocket);
-        throw std::runtime_error("Failed to receive chat code from client");
+    void connectToServer(const std::string& ip) {
+        clientSocket = socket(AF_INET, SOCK_STREAM, 0);
+        if (clientSocket == -1) {
+            throw std::runtime_error("Failed to create client socket");
+        }
+
+        struct sockaddr_in serverAddr;
+        std::memset(&serverAddr, 0, sizeof(serverAddr));
+        serverAddr.sin_family = AF_INET;
+        serverAddr.sin_port = htons(PORT);
+        inet_pton(AF_INET, ip.c_str(), &serverAddr.sin_addr);
+
+        ConnectionAnimator animator;
+        animator.startAnimation();
+
+        if (connect(clientSocket, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
+            animator.stopAnimation();
+            throw std::runtime_error("Failed to connect to server");
+        } else {
+            send(clientSocket, chatCode.c_str(), chatCode.length(), 0);
+
+            std::chrono::time_point<std::chrono::system_clock> start = std::chrono::system_clock::now();
+            char buffer[BUFFER_SIZE];
+            int await_time = 3;
+
+            while (std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now() - start).count() < await_time) {
+                std::memset(buffer, 0, BUFFER_SIZE);
+                ssize_t bytesRead = recv(clientSocket, buffer, BUFFER_SIZE - 1, 0);
+                if (bytesRead > 0) {
+                    std::string receivedHash = std::string(buffer, bytesRead);
+                    if (receivedHash == "/connected") {
+                        animator.stopAnimation();
+                        std::cout << "Authenticated" << std::endl;
+                        return;
+                    }
+                }
+            }
+
+            animator.stopAnimation();
+            throw std::runtime_error("Failed to receive response from server");
+        }
     }
-
-    std::string receivedHash = std::string(buffer, bytesRead);
-    if (receivedHash != chatCode) {
-        close(clientSocket);
-        throw std::runtime_error("Invalid chat code from client");
-    }
-
-    std::string sc = "/connected";
-    send(clientSocket, sc.c_str(), sc.length(), 0);
-    std::cout << "Client connected with valid chat code" << std::endl;
-  }
-
-  void connectToServer(const std::string& ip) {
-      clientSocket = socket(AF_INET, SOCK_STREAM, 0);
-      if (clientSocket == -1) {
-          throw std::runtime_error("Failed to create client socket");
-      }
-
-      struct sockaddr_in serverAddr;
-      std::memset(&serverAddr, 0, sizeof(serverAddr));
-      serverAddr.sin_family = AF_INET;
-      serverAddr.sin_port = htons(PORT);
-      inet_pton(AF_INET, ip.c_str(), &serverAddr.sin_addr);
-
-      ConnectionAnimator animator;
-      animator.startAnimation();
-
-      if (connect(clientSocket, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
-          animator.stopAnimation();
-          throw std::runtime_error("Failed to connect to server");
-      } else {
-          send(clientSocket, chatCode.c_str(), chatCode.length(), 0);
-
-          std::chrono::time_point<std::chrono::system_clock> start = std::chrono::system_clock::now();
-          char buffer[BUFFER_SIZE];
-          int await_time = 2;
-
-          while (std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now() - start).count() < await_time) {
-              std::memset(buffer, 0, BUFFER_SIZE);
-              ssize_t bytesRead = recv(clientSocket, buffer, BUFFER_SIZE - 1, 0);
-              if (bytesRead > 0) {
-                  std::string receivedHash = std::string(buffer, bytesRead);
-                  if (receivedHash == "/connected") {
-                      animator.stopAnimation();
-                      std::cout << "Authenticated" << std::endl;
-                      return;
-                  }
-              }
-              // std::this_thread::sleep_for(std::chrono::milliseconds(100));
-          }
-
-          animator.stopAnimation();
-          throw std::runtime_error("Failed to receive response from server");
-          close(clientSocket);
-      }
-  }
 
     void receiveMessages() {
         char buffer[BUFFER_SIZE];
@@ -215,7 +214,6 @@ private:
 
     void sendMessages() {
         std::string input;
-        // First, send the chat code for authentication
         send(clientSocket, chatCode.c_str(), chatCode.length(), 0);
 
         while (running) {
@@ -298,11 +296,11 @@ int main(int argc, char* argv[]) {
         if (mode == "-s") {
             chat.startServer();
         } else if (mode == "-c") {
-          if (argc == 4 ) {
-             chat.startClient(argv[3]);
-          }else {
-            chat.startClient(DEFAULT_IP);
-          }
+            if (argc == 4) {
+                chat.startClient(argv[3]);
+            } else {
+                chat.startClient(DEFAULT_IP);
+            }
         } else {
             std::cout << "Invalid arguments\n";
             return 1;
