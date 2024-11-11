@@ -20,10 +20,20 @@
 #include <vector>
 #include <map>
 #include <chrono>
+#include <fstream>
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#include <sys/stat.h>
+#include <signal.h>
+#include <algorithm>
+#include <vector>
+#include <sys/types.h>
+#include <sys/wait.h>
 
 const int PORT = 8080;
 const int BUFFER_SIZE = 1024;
 const std::string DEFAULT_IP = "0.0.0.0";
+const char* SESSION_FILE = "/tmp/chatV2_session";
 
 std::string generateRandomKey(int length = 16) {
     const std::string charset = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
@@ -123,6 +133,13 @@ struct ConnectionStats {
   }
 };
 
+struct SharedSessionData {
+    pid_t server_pid;
+    int active_connections;
+    bool valid;
+    ConnectionStats stats[10];
+};
+
 class NetworkMonitor {
 private:
     std::map<int, ConnectionStats> connections;
@@ -130,72 +147,225 @@ private:
     bool isRunning;
     bool displayEnabled;
     std::thread monitorThread;
+    int shmid;
+    SharedSessionData* sharedData;
+    std::string programName;
 
-public:
-    NetworkMonitor() : isRunning(false), displayEnabled(false) {}
-
-    void startMonitoring(bool showDisplay = false) {
-        isRunning = true;
-        displayEnabled = showDisplay;
-        monitorThread = std::thread([this]() {
-            while (isRunning) {
-                if (displayEnabled) {
-                    displayStats();
-                }
-                std::this_thread::sleep_for(std::chrono::seconds(3));
-            }
-        });
-        monitorThread.detach();
+    std::string getCurrentDateTime() {
+        auto now = std::chrono::system_clock::now();
+        auto in_time_t = std::chrono::system_clock::to_time_t(now);
+        std::stringstream ss;
+        ss << std::put_time(std::localtime(&in_time_t), "%Y-%m-%d %H:%M:%S");
+        return ss.str();
     }
 
-    void stopMonitoring() {
-      isRunning = false;
-      if (monitorThread.joinable()) {
-        monitorThread.join();
-      }
+
+ void findRunningServer() {
+        std::vector<std::string> commands = {
+            "pgrep -f \"./chatV2\"",
+            "ps aux | grep \"./chatV2\" | grep -v grep | awk '{print $2}'",
+            "pidof chatV2"
+        };
+
+        for (const auto& cmd : commands) {
+            FILE* pipe = popen(cmd.c_str(), "r");
+            if (!pipe) continue;
+
+            char buffer[128];
+            std::string result = "";
+            while (!feof(pipe)) {
+                if (fgets(buffer, 128, pipe) != NULL)
+                    result += buffer;
+            }
+            pclose(pipe);
+
+            // Clean the result string
+            result.erase(std::remove_if(result.begin(), result.end(), 
+                [](unsigned char c) { return std::isspace(c); }), result.end());
+
+            if (!result.empty()) {
+                try {
+                    pid_t serverPid = std::stoi(result);
+                    if (kill(serverPid, 0) == 0) {
+                        std::cout << "Found server with PID: " << serverPid << std::endl;
+                        return;
+                    }
+                } catch (...) {
+                    continue;
+                }
+            }
+        }
+        
+        throw std::runtime_error("No running server found. Make sure the server is running with './chatV2 -s'");
+    }
+
+    bool verifySharedMemory() {
+        key_t key = ftok(SESSION_FILE, 'R');
+        int testShmid = shmget(key, sizeof(SharedSessionData), 0666);
+        return testShmid != -1;
+    }
+
+    void createSharedMemory() {
+        key_t key = ftok(SESSION_FILE, 'R');
+        shmid = shmget(key, sizeof(SharedSessionData), IPC_CREAT | 0666);
+        if (shmid < 0) {
+            throw std::runtime_error("Failed to create shared memory: " + std::string(strerror(errno)));
+        }
+        sharedData = (SharedSessionData*)shmat(shmid, nullptr, 0);
+        if (sharedData == (void*)-1) {
+            throw std::runtime_error("Failed to attach shared memory: " + std::string(strerror(errno)));
+        }
+    }
+
+public:
+    NetworkMonitor() : isRunning(false), displayEnabled(false), shmid(-1), sharedData(nullptr) {
+        // Create session file with proper permissions
+        std::ofstream sessionFile(SESSION_FILE);
+        sessionFile.close();
+        chmod(SESSION_FILE, 0666);
+    }
+
+    void startMonitoring(bool showDisplay = false, bool attachMode = false) {
+        isRunning = true;
+        displayEnabled = showDisplay;
+
+        if (attachMode) {
+            try {
+                // First verify if shared memory exists
+                if (!verifySharedMemory()) {
+                    std::cout << "Waiting for server shared memory to be available...\n";
+                    int retries = 0;
+                    while (!verifySharedMemory() && retries < 5) {
+                        std::this_thread::sleep_for(std::chrono::seconds(1));
+                        retries++;
+                    }
+                    if (!verifySharedMemory()) {
+                        throw std::runtime_error("Could not connect to server's shared memory");
+                    }
+                }
+
+                findRunningServer();
+                createSharedMemory();
+                std::cout << "Successfully connected to server monitoring system\n";
+            } catch (const std::exception& e) {
+                std::cerr << "Error: " << e.what() << "\n";
+                std::cerr << "Debugging information:\n";
+                system("ps aux | grep chatV2");
+                std::cerr << "\nMake sure the server is running with './chatV2 -s'\n";
+                isRunning = false;
+                return;
+            }
+        }    void displaySharedStats() {
+        if (!sharedData) return;
+
+        system("clear");  // Clear screen for better visibility
+
+        std::cout << "\n╔════════════════════════════════════════════════════════════╗\n";
+        std::cout << "║                   Network Monitor v2.0                      ║\n";
+        std::cout << "╠════════════════════════════════════════════════════════════╣\n";
+
+        std::cout << "║ Time: " << std::left << std::setw(48) << getCurrentDateTime() << "║\n";
+        std::cout << "║ Server PID: " << std::left << std::setw(43) << sharedData->server_pid << "║\n";
+        std::cout << "║ Active Connections: " << std::left << std::setw(37) << sharedData->active_connections << "║\n";
+        std::cout << "╠════════════════════════════════════════════════════════════╣\n";
+
+        for (int i = 0; i < sharedData->active_connections; i++) {
+            const auto& stats = sharedData->stats[i];
+            auto now = std::chrono::system_clock::now();
+            auto duration = std::chrono::duration_cast<std::chrono::minutes>(
+                now - stats.connectedTime).count();
+
+            std::cout << "║ Connection #" << (i + 1) << std::setw(43) << " ║\n";
+            std::cout << "╟────────────────────────────────────────────────────────────╢\n";
+            std::cout << "║ IP:Port: " << std::left << std::setw(45) 
+                     << (stats.peerAddress + ":" + std::to_string(stats.peerPort)) << "║\n";
+            std::cout << "║ Duration: " << std::left << std::setw(44) 
+                     << (std::to_string(duration) + " minutes") << "║\n";
+            std::cout << "║ Bytes Sent: " << std::left << std::setw(43) 
+                     << formatBytes(stats.bytesSent) << "║\n";
+            std::cout << "║ Bytes Received: " << std::left << std::setw(40) 
+                     << formatBytes(stats.bytesReceived) << "║\n";
+            std::cout << "║ Messages Sent: " << std::left << std::setw(41) 
+                     << stats.messagesSent << "║\n";
+            std::cout << "║ Messages Received: " << std::left << std::setw(38) 
+                     << stats.messagesReceived << "║\n";
+        }
+
+        std::cout << "╚════════════════════════════════════════════════════════════╝\n";
+        std::cout << "\nPress Ctrl+C to exit monitor mode\n";
+    }
+
+    std::string formatBytes(size_t bytes) {
+        const char* units[] = {"B", "KB", "MB", "GB"};
+        int unit = 0;
+        double size = bytes;
+
+        while (size >= 1024 && unit < 3) {
+            size /= 1024;
+            unit++;
+        }
+
+        std::stringstream ss;
+        ss << std::fixed << std::setprecision(2) << size << " " << units[unit];
+        return ss.str();
+    }
+
+    void updateSharedMemory() {
+        if (!sharedData) return;
+
+        std::lock_guard<std::mutex> lock(statsMutex);
+        sharedData->server_pid = getpid();
+        sharedData->active_connections = connections.size();
+        sharedData->valid = true;
+
+        int i = 0;
+        for (const auto& [socket, stats] : connections) {
+            if (i >= 10) break;
+            sharedData->stats[i] = stats;
+            i++;
+        }
     }
 
     void addConnection(int socket, const std::string& address, int port) {
-      std::lock_guard<std::mutex> lock(statsMutex);
-      connections[socket] = ConnectionStats();
-      connections[socket].peerAddress = address;
-      connections[socket].peerPort = port;
+        std::lock_guard<std::mutex> lock(statsMutex);
+        connections[socket] = ConnectionStats();
+        connections[socket].peerAddress = address;
+        connections[socket].peerPort = port;
+        updateSharedMemory();
     }
 
-    void updateStats(int socket, size_t bytesSent, size_t bytesReceived, size_t msgSent = 0, size_t messagesReceived = 0) {
-      std::lock_guard<std::mutex> lock(statsMutex);
-      if(connections.find(socket) != connections.end()) {
-        connections[socket].bytesSent += bytesSent;
-        connections[socket].bytesReceived += bytesReceived;
-        connections[socket].messagesSent += msgSent;
-        connections[socket].messagesReceived += messagesReceived;
-      }
+    void updateStats(int socket, size_t bytesSent, size_t bytesReceived, 
+                    size_t msgSent = 0, size_t msgReceived = 0) {
+        std::lock_guard<std::mutex> lock(statsMutex);
+        if (connections.find(socket) != connections.end()) {
+            connections[socket].bytesSent += bytesSent;
+            connections[socket].bytesReceived += bytesReceived;
+            connections[socket].messagesSent += msgSent;
+            connections[socket].messagesReceived += msgReceived;
+            updateSharedMemory();
+        }
     }
 
-    void displayStats() {
-      std::lock_guard<std::mutex> lock(statsMutex);
-      system("clear");
-      std::cout << "\n=== Network Monitor ===\n";
-      for (const auto& [socket, stats] : connections) {
-        auto now = std::chrono::system_clock::now();
-        auto duration = std::chrono::duration_cast<std::chrono::seconds>(now - stats.connectedTime).count();
-
-        std::cout << "\nConncetion " << socket << " (" << stats.peerAddress << ":" << stats.peerPort << ")\n";
-        std::cout << "Connceted for: " << duration << " seconds\n";
-        std::cout << "Bytes sent: " << stats.bytesSent << "\n";
-        std::cout << "Bytes received: " << stats.bytesReceived << "\n";
-        std::cout << "Messages sent: " << stats.messagesSent << "\n";
-        std::cout << "Messages received: " << stats.messagesReceived << "\n";
-      }
-    
-      std::cout << "\n=========================\n";
+    void stopMonitoring() {
+        isRunning = false;
+        if (monitorThread.joinable()) {
+            monitorThread.join();
+        }
     }
 
     ~NetworkMonitor() {
-      stopMonitoring();
+        stopMonitoring();
+        if (sharedData) {
+            shmdt(sharedData);
+        }
+        if (shmid >= 0) {
+            shmctl(shmid, IPC_RMID, nullptr);
+        }
+        if (std::remove(SESSION_FILE) != 0) {
+            std::cerr << "Error removing session file: " << strerror(errno) << std::endl;
+        }
     }
 };
-
 class P2PChat {
 private:
     int serverSocket;
@@ -396,8 +566,15 @@ public:
     
     void startServer() {
         setupServer();
+
+        monitor.createSharedMemory();
+        sharedData->valid = true;
+        sharedData->server_pid = getpid();
+        sharedData->active_connections = 0;
+        
         std::cout << "Username: " << username << std::endl;
         std::cout << "Waiting for connection..." << std::endl;
+        std::cout << "Server PID: " << getpid() << std::endl;
         acceptConnection();
         
         monitor.addConnection(clientSocket, "client", PORT);
@@ -446,13 +623,14 @@ int main(int argc, char* argv[]) {
     std::string chatCode;
     std::string username;
     std::string serverIp = DEFAULT_IP;
-    bool monitorMode = false;
+    bool attachMode = false;
 
-    // Parse command line arguments
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "-s" || arg == "-c" || arg == "-m") {
             mode = arg;
+        } else if (arg == "-a") {
+            attachMode = true;
         } else if (arg == "-k" && i + 1 < argc) {
             chatCode = argv[++i];
         } else if (arg == "-u" && i + 1 < argc) {
@@ -466,12 +644,14 @@ int main(int argc, char* argv[]) {
         std::cout << "Usage:\n";
         std::cout << "As server: " << argv[0] << " -s [-k <chat_code>] [-u <username>]\n";
         std::cout << "As client: " << argv[0] << " -c [server_ip] -k <chat_code> [-u <username>]\n";
-        std::cout << "As monitor: " << argv[0] << " -m\n";
+        std::cout << "As monitor: " << argv[0] << " -m [-a]\n";
+        std::cout << "  -a: attach to running server session\n";
         return 1;
     }
 
+    if (mode == "-m") {
         NetworkMonitor monitor;
-        monitor.startMonitoring();
+        monitor.startMonitoring(true, attachMode);
         std::cout << "Press Enter to stop monitoring...\n";
         std::cin.get();
         return 0;
@@ -482,7 +662,6 @@ int main(int argc, char* argv[]) {
         std::cout << "Code: " << chatCode << std::endl;
     }
 
-    // Verify client has chat code
     if (mode == "-c" && chatCode.empty()) {
         std::cout << "Error: Chat code is required for client mode.\n";
         std::cout << "Use -k <chat_code> to specify the code.\n";
