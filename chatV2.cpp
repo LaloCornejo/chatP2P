@@ -209,100 +209,6 @@ private:
         return (p != NULL);
     }
 
-    void monitorStatus() {
-        while (running) {
-            auto now = std::chrono::system_clock::now();
-            auto heartbeatDiff = std::chrono::duration_cast<std::chrono::milliseconds>(
-                now - stats.lastHeartbeat
-            ).count();
-
-            if (heartbeatDiff > HEARTBEAT_INTERVAL_MS) {
-                sendHeartbeat();
-                stats.lastHeartbeat = now;
-            }
-
-            std::cout << "\r[Status] Connected(" << stats.currentProtocol << "): " 
-                     << (stats.isConnected ? "Yes" : "No")
-                     << " | Latency: " << stats.latency << "ms"
-                     << " | Bytes Sent: " << stats.bytesSent
-                     << " | Bytes Received: " << stats.bytesReceived
-                     << " | User: " << username
-                     << std::flush;
-
-            std::this_thread::sleep_for(std::chrono::milliseconds(STATUS_UPDATE_INTERVAL_MS));
-        }
-    }
-
-    void sendHeartbeat() {
-        if (clientSocket != -1) {
-            std::string heartbeat = "/heartbeat";
-            auto start = std::chrono::high_resolution_clock::now();
-            send(clientSocket, heartbeat.c_str(), heartbeat.length(), 0);
-            stats.bytesSent += heartbeat.length();
-            
-            char buffer[BUFFER_SIZE];
-            std::memset(buffer, 0, BUFFER_SIZE);
-            if (recv(clientSocket, buffer, BUFFER_SIZE - 1, MSG_DONTWAIT) > 0) {
-                auto end = std::chrono::high_resolution_clock::now();
-                stats.latency = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    end - start
-                ).count();
-            }
-        }
-    }
-
-    void receiveMessages() {
-        char buffer[BUFFER_SIZE];
-        while (running) {
-            std::memset(buffer, 0, BUFFER_SIZE);
-            ssize_t bytesRead = recv(clientSocket, buffer, BUFFER_SIZE - 1, 0);
-            
-            if (bytesRead <= 0) {
-                if (running) {
-                    messageQueue.push("\nConnection lost. Attempting to reconnect...");
-                    if (!attemptReconnection()) {
-                        messageQueue.push("\nFailed to reconnect. Exiting...");
-                        running = false;
-                    }
-                }
-                break;
-            }
-
-            stats.bytesReceived += bytesRead;
-            std::string message(buffer);
-            
-            if (message == "/heartbeat") {
-                send(clientSocket, message.c_str(), message.length(), 0);
-                continue;
-            }
-
-            messageQueue.push("\n" + username + ": " + message);
-        }
-    }
-
-    bool attemptReconnection() {
-        for (int attempt = 0; attempt < RECONNECT_ATTEMPTS; ++attempt) {
-            animator.startAnimation("Attempting reconnection (" + 
-                                 std::to_string(attempt + 1) + "/" +
-                                 std::to_string(RECONNECT_ATTEMPTS) + ")...");
-            
-            if (clientSocket != -1) {
-                close(clientSocket);
-            }
-
-            if (connectToDualStack(DEFAULT_IP)) {
-                animator.stopAnimation();
-                messageQueue.push("\nReconnected successfully!");
-                stats.isConnected = true;
-                return true;
-            }
-
-            std::this_thread::sleep_for(std::chrono::milliseconds(RECONNECT_DELAY_MS));
-        }
-        animator.stopAnimation();
-        return false;
-    }
-
 public:
     P2PChat(const std::string& code, const std::string& username = "") 
         : running(true), serverSocket(-1), clientSocket(-1) {
@@ -439,6 +345,7 @@ public:
         }
 
         std::string authMessage = chatCode + "|" + username;
+        std::cout << chatCode << username << std::endl;
         send(clientSocket, authMessage.c_str(), authMessage.length(), 0);
 
         char buffer[BUFFER_SIZE];
@@ -540,28 +447,30 @@ public:
     }
 
     void receiveMessages() {
-        char buffer[BUFFER_SIZE];
-        while (running) {
-            std::memset(buffer, 0, BUFFER_SIZE);
-            ssize_t bytesRead = recv(clientSocket, buffer, BUFFER_SIZE - 1, 0);
-            if (bytesRead <= 0) {
-                if (running) {
-                    stats.isConnected = false;
-                    messageQueue.push("\nConnection lost");
-                }
-                running = false;
-                break;
-            }
+      char buffer[BUFFER_SIZE];
+      while (running) {
+          std::memset(buffer, 0, BUFFER_SIZE);
+          ssize_t bytesRead = recv(clientSocket, buffer, BUFFER_SIZE - 1, 0);
+          if (bytesRead <= 0) {
+              if (running) {
+                  stats.isConnected = false;
+                  messageQueue.push("\nConnection lost");
+              }
+              running = false;
+              break;
+          }
 
-            std::string message(buffer, bytesRead);
-            if (message == "/heartbeat") {
-                send(clientSocket, message.c_str(), message.length(), 0);
-                continue;
-            }
+          if (bytesRead > 0) {
+              std::string message(buffer, std::min(bytesRead, static_cast<ssize_t>(BUFFER_SIZE - 1)));
+              if (message == "/heartbeat") {
+                  send(clientSocket, message.c_str(), message.length(), 0);
+                  continue;
+              }
 
-            stats.bytesReceived += bytesRead;
-            messageQueue.push("\nReceived: " + message);
-        }
+              stats.bytesReceived += bytesRead;
+              messageQueue.push("\nReceived: " + message);
+          }
+      }
     }
 
     void sendMessages() {
