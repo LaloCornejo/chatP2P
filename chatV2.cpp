@@ -21,6 +21,7 @@
 #include <chrono>
 #include <algorithm>
 #include <atomic>
+#include <random>
 
 const int PORT = 8080;
 const int BUFFER_SIZE = 1024;
@@ -114,6 +115,19 @@ private:
     NetworkStats stats;
     UserContext userContext;
     ConnectionAnimator animator;
+
+    std::string generateRandomCode(int length = 9) {
+       const std::string characters = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_int_distribution<> dis(0, characters.length() - 1);
+        
+        std::string code;
+        for (int i = 0; i < length; ++i) {
+            code += characters[dis(gen)];
+        }
+        return code;
+    }
 
     std::string generateHash(const std::string& input) {
         unsigned char hash[EVP_MAX_MD_SIZE];
@@ -210,14 +224,28 @@ private:
     }
 
 public:
-    P2PChat(const std::string& code, const std::string& username = "") 
+    P2PChat(const std::string& username = "") 
         : running(true), serverSocket(-1), clientSocket(-1) {
-        chatCode = generateHash(code);
+        std::string randomCode = generateRandomCode();
+        chatCode = generateHash(randomCode);
+        
         this->username = username.empty() ? promptUsername() : username;
         userContext.username = this->username;
         userContext.isAuthenticated = false;
         userContext.lastActive = std::chrono::system_clock::now();
         stats.lastHeartbeat = std::chrono::system_clock::now();
+        
+        std::cout << "Kode: " << randomCode << std::endl;
+    }
+
+    std::string promptCode() {
+        std::string code;
+        do {
+            std::cout << "Enter chat code: ";
+            std::getline(std::cin, code);
+            code = trim(code);
+        } while (code.empty());
+        return code;
     }
 
     std::string promptUsername() {
@@ -290,6 +318,7 @@ public:
         }
 
         std::string receivedMsg(buffer, bytesRead);
+        std::cout << receivedMsg << std::endl;
         size_t delimPos = receivedMsg.find('|');
         if (delimPos == std::string::npos) {
             close(clientSocket);
@@ -310,7 +339,9 @@ public:
         stats.isConnected = true;
     }
 
-    void connectToServer(const std::string& ip) {
+    void connectToServer(const std::string& ip, const std::string& code) {
+      std::string clientCode = code;
+        std::cout <<  chatCode << std::endl;
         struct addrinfo hints, *servinfo, *p;
         std::memset(&hints, 0, sizeof hints);
         hints.ai_family = AF_UNSPEC;  // Allow both IPv4 and IPv6
@@ -344,8 +375,7 @@ public:
             throw std::runtime_error("Failed to connect");
         }
 
-        std::string authMessage = chatCode + "|" + username;
-        std::cout << chatCode << username << std::endl;
+        std::string authMessage = clientCode + "|" + username;
         send(clientSocket, authMessage.c_str(), authMessage.length(), 0);
 
         char buffer[BUFFER_SIZE];
@@ -400,7 +430,7 @@ public:
             }
 
             try {
-                connectToServer(DEFAULT_IP);
+                connectToServer(DEFAULT_IP, chatCode);
                 std::cout << "\nReconnected successfully!" << std::endl;
                 return true;
             } catch (const std::exception& e) {
@@ -514,8 +544,8 @@ public:
         cleanup();
     }
 
-    void startClient(const std::string& ip) {
-        connectToServer(ip);
+    void startClient(const std::string& ip, const std::string& code) {
+        connectToServer(ip, code);
         std::cout << "Connected to server\n";
 
         std::thread receiveThread(&P2PChat::receiveMessages, this);
@@ -550,42 +580,44 @@ public:
 
 int main(int argc, char* argv[]) {
     std::string username;
-    std::string chatCode;
     std::string mode;
     std::string serverIP = DEFAULT_IP;
+    std::string code;
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "-s" || arg == "-c") {
             mode = arg;
+        }else if (arg == "-k" && i + 1 < argc) {
+            code = argv[++i];
         } else if (arg == "-u" && i + 1 < argc) {
             username = argv[++i];
         } else if (arg == "-ip" && i + 1 < argc) {
             serverIP = argv[++i];
-        } else if (chatCode.empty()) {
-            chatCode = arg;
         }
     }
 
-    if (chatCode.empty()) {
+    if (mode.empty()) {
         std::cout << "Usage:\n"
-                  << "As server: " << argv[0] << " -s <chat_code> [-u username]\n"
-                  << "As client: " << argv[0] << " -c <chat_code> [-u username] [-ip server_ip]\n"
+                  << "As server: " << argv[0] << " -s [-u username]\n"
+                  << "As client: " << argv[0] << " -c -ip <server_ip> [-u username]\n"
                   << "Options:\n"
                   << "  -u <username>   Set username\n"
-                  << "  -ip <server_ip> Specify server IP (client mode only)\n";
+                  << "  -ip <server_ip> Specify server IP (required for client mode)\n";
         return 1;
     }
 
     try {
-        P2PChat chat(chatCode, username);
+        P2PChat chat(username);
+        
         if (mode == "-s") {
             chat.startServer();
         } else if (mode == "-c") {
-            chat.startClient(serverIP);
-        } else {
-            std::cout << "Invalid mode. Use -s for server or -c for client.\n";
-            return 1;
+            if (serverIP == DEFAULT_IP) {
+                std::cout << "Error: Server IP is required in client mode\n";
+                return 1;
+            }
+            chat.startClient(serverIP, code);
         }
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
